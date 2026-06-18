@@ -6,7 +6,7 @@ description = "Open-source iOS Device Hub: live screen mirror + remote control (
 license = "MIT"
 
 [dependencies]
-idevice = { path = "../idevice/idevice", features = ["full"] }
+idevice = { version = "0.1.63", features = ["full"] }
 # `persistence` lets eframe store our VNC settings (host/port/password/enabled)
 # in a platform-appropriate config dir across launches.
 eframe = { version = "0.29", features = ["persistence"] }
