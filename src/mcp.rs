@@ -5,7 +5,8 @@
 // are converted to the device's native normalized touch space via
 // `unrotate_norm`/`norm`, so taps land correctly regardless of rotation.
 
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use rmcp::{
@@ -37,12 +38,21 @@ const TAP_HOLD_SAMPLES: u32 = 3;
 /// Delay between successive touch samples within a tap (~ one HID report tick).
 const TAP_SAMPLE_MS: u64 = 25;
 
-/// Pause after a gesture before returning, so a following `screenshot` reflects
-/// the post-gesture state (e.g. navigation animations).
-const SETTLE: Duration = Duration::from_millis(250);
+const SETTLE_MIN: Duration = Duration::from_millis(200);
 
-/// Spacing, in screen pixels, between coordinate-grid lines; every 5th is major.
+const SETTLE_MAX: Duration = Duration::from_millis(2600);
+
+const TAP_CHANGED_DIFF: f32 = 6.0;
+
+const SETTLE_POLL: Duration = Duration::from_millis(110);
+
+const SETTLE_DIFF: f32 = 2.5;
+
+const SETTLE_STABLE_SAMPLES: u32 = 3;
+
 const GRID_STEP: u32 = 100;
+
+const GRID_LABEL_EVERY: u32 = 2;
 
 /// Default cap on the screenshot's longer edge, in pixels. Phone screens are
 /// ~2.5–3 MP natively, which costs an LLM thousands of image tokens per look;
@@ -63,6 +73,8 @@ pub struct DeviceHub {
     error: ErrorSlot,
     status: StatusSlot,
     control: UnboundedSender<ControlCmd>,
+    last_image: Arc<Mutex<Option<(u32, u32)>>>,
+    last_tap: Arc<Mutex<Option<(f32, f32)>>>,
     tool_router: ToolRouter<DeviceHub>,
 }
 
@@ -141,6 +153,41 @@ pub struct ConnectParams {
 fn display_dims(frame: &Frame, turns: u8) -> (u32, u32) {
     let (w, h) = (frame.width as u32, frame.height as u32);
     if turns % 2 == 1 { (h, w) } else { (w, h) }
+}
+
+fn frame_signature(frame: &Frame) -> Vec<u8> {
+    const N: usize = 24; // N×N samples
+    let (w, h) = (frame.width, frame.height);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let mut sig = Vec::with_capacity(N * N);
+    for j in 0..N {
+        let y = ((j * h) / N + h / (2 * N)).min(h - 1);
+        for i in 0..N {
+            let x = ((i * w) / N + w / (2 * N)).min(w - 1);
+            let p = (y * w + x) * 4;
+            // Rec.601-ish luma, integer-weighted (R*2 + G*5 + B) / 8.
+            let luma = (frame.rgba[p] as u16 * 2
+                + frame.rgba[p + 1] as u16 * 5
+                + frame.rgba[p + 2] as u16)
+                / 8;
+            sig.push(luma as u8);
+        }
+    }
+    sig
+}
+
+fn signature_diff(a: &[u8], b: &[u8]) -> f32 {
+    if a.is_empty() || a.len() != b.len() {
+        return f32::INFINITY;
+    }
+    let sum: u32 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs())
+        .sum();
+    sum as f32 / a.len() as f32
 }
 
 /// Render a native frame into upright RGBA at its displayed dimensions, undoing
@@ -295,7 +342,7 @@ fn draw_grid(buf: &mut [u8], img_w: u32, img_h: u32, dev_w: u32, dev_h: u32) {
 
     let mut x = GRID_STEP;
     while x < dev_w {
-        let major = x.is_multiple_of(GRID_STEP * 5);
+        let major = x.is_multiple_of(GRID_STEP * GRID_LABEL_EVERY);
         let a = if major { 0.7 } else { 0.3 };
         let px = (x as f32 * fx).round() as i32;
         for y in 0..img_h {
@@ -313,7 +360,7 @@ fn draw_grid(buf: &mut [u8], img_w: u32, img_h: u32, dev_w: u32, dev_h: u32) {
 
     let mut y = GRID_STEP;
     while y < dev_h {
-        let major = y.is_multiple_of(GRID_STEP * 5);
+        let major = y.is_multiple_of(GRID_STEP * GRID_LABEL_EVERY);
         let a = if major { 0.7 } else { 0.3 };
         let py = (y as f32 * fy).round() as i32;
         for x in 0..img_w {
@@ -328,6 +375,30 @@ fn draw_grid(buf: &mut [u8], img_w: u32, img_h: u32, dev_w: u32, dev_h: u32) {
             draw_number(buf, img_w, img_h, right_x, py + 3, scale, y);
         }
         y += GRID_STEP;
+    }
+}
+
+fn draw_marker(buf: &mut [u8], img_w: u32, img_h: u32, cx: i32, cy: i32) {
+    const C: [u8; 3] = [0, 255, 255];
+    let r = (img_w.max(img_h) / 64).max(7) as i32;
+    // Ring: step in fine angular increments so it stays connected at this radius.
+    let steps = (r * 8).max(64);
+    for s in 0..steps {
+        let ang = s as f32 / steps as f32 * std::f32::consts::TAU;
+        let (sin, cos) = ang.sin_cos();
+        let x = cx + (r as f32 * cos).round() as i32;
+        let y = cy + (r as f32 * sin).round() as i32;
+        blend_px(buf, img_w, img_h, x, y, C, 1.0);
+        blend_px(buf, img_w, img_h, x + 1, y, C, 0.5);
+        blend_px(buf, img_w, img_h, x, y + 1, C, 0.5);
+    }
+    // Crosshair through the centre, with a small gap so the exact point is visible.
+    for d in -r..=r {
+        if d.abs() < r / 4 {
+            continue;
+        }
+        blend_px(buf, img_w, img_h, cx + d, cy, C, 0.9);
+        blend_px(buf, img_w, img_h, cx, cy + d, C, 0.9);
     }
 }
 
@@ -394,6 +465,8 @@ impl DeviceHub {
             error,
             status,
             control,
+            last_image: Arc::new(Mutex::new(None)),
+            last_tap: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
@@ -403,23 +476,49 @@ impl DeviceHub {
     fn to_device(&self, x: f32, y: f32) -> Option<(u16, u16)> {
         let (_, frame) = self.frames.latest()?;
         let turns = self.orientation.get().quarter_turns_cw();
-        let (dw, dh) = display_dims(&frame, turns);
+        let (dw, dh) = self
+            .last_image
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| display_dims(&frame, turns));
         let fx = ((x + 0.5) / dw as f32).clamp(0.0, 1.0);
         let fy = ((y + 0.5) / dh as f32).clamp(0.0, 1.0);
         let (nx, ny) = unrotate_norm(fx, fy, turns);
         Some((norm(nx), norm(ny)))
     }
 
+    async fn settle(&self) {
+        tokio::time::sleep(SETTLE_MIN).await;
+        let start = Instant::now();
+        let mut prev = self.frames.latest().map(|(_, f)| frame_signature(&f));
+        let mut stable = 0u32;
+        while start.elapsed() < SETTLE_MAX {
+            tokio::time::sleep(SETTLE_POLL).await;
+            let cur = self.frames.latest().map(|(_, f)| frame_signature(&f));
+            match (&prev, &cur) {
+                (Some(a), Some(b)) if signature_diff(a, b) < SETTLE_DIFF => {
+                    stable += 1;
+                    if stable >= SETTLE_STABLE_SAMPLES {
+                        break;
+                    }
+                }
+                // Any motion (or a dropped frame) resets the quiet streak.
+                _ => stable = 0,
+            }
+            prev = cur;
+        }
+    }
+
     #[tool(
         description = "Capture the current screen of the connected iPhone as a PNG. \
         The image is downscaled for transfer (longer edge capped at 1024px by \
-        default; raise via `max_dim` for fine detail), but tap/swipe coordinates \
-        are always in the full screen coordinate space reported in the response \
-        text (origin top-left). By default a labeled coordinate grid is overlaid, \
-        labeled in screen coordinates, so you can read tap/swipe coordinates \
-        directly off the image. Call this before and after acting. Note that the \
-        device hides the passcode input, so you will have to enter passcodes via \
-        the keyboard."
+        default; raise via `max_dim` for fine detail). Tap/swipe coordinates are \
+        pixels in the returned image itself (origin top-left) — the size is \
+        reported in the response text and the image is what you measure against, \
+        so what you see is the coordinate space. By default a labeled coordinate \
+        grid is overlaid so you can read tap/swipe coordinates directly off the \
+        image. Call this before and after acting. Note that the device hides the \
+        passcode input, so you will have to enter passcodes via the keyboard."
     )]
     async fn screenshot(
         &self,
@@ -440,10 +539,21 @@ impl DeviceHub {
         // screen coordinates onto the smaller buffer (so labels stay true and
         // glyphs stay crisp).
         let (iw, ih, mut rgba) = downscale(rgba, w, h, max_dim.unwrap_or(DEFAULT_MAX_DIM));
+        // Tap/swipe coordinates live in the space of *this* image, so record its
+        // dimensions for `to_device` and label the grid in image pixels.
+        *self.last_image.lock().unwrap() = Some((iw, ih));
         let gridded = grid.unwrap_or(true);
         if gridded {
-            draw_grid(&mut rgba, iw, ih, w, h);
+            draw_grid(&mut rgba, iw, ih, iw, ih);
         }
+        let marked = if let Some((mfx, mfy)) = *self.last_tap.lock().unwrap() {
+            let mx = (mfx * iw as f32).round() as i32;
+            let my = (mfy * ih as f32).round() as i32;
+            draw_marker(&mut rgba, iw, ih, mx, my);
+            true
+        } else {
+            false
+        };
 
         let mut png = Vec::new();
         use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
@@ -452,34 +562,30 @@ impl DeviceHub {
             .map_err(|e| McpError::internal_error(format!("PNG encode failed: {e}"), None))?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
 
-        let scaled = (iw, ih) != (w, h);
-        let note = match (gridded, scaled) {
-            (true, false) => format!(
-                "Screen is {w}x{h} pixels (width x height). A coordinate grid is \
+        let mut note = if gridded {
+            format!(
+                "Image is {iw}x{ih} pixels (width x height); tap/swipe coordinates \
+                 are pixels in THIS image (origin top-left). A coordinate grid is \
                  overlaid: magenta lines every {GRID_STEP}px, with brighter lines \
                  labeled (yellow) every {}px — x values along the top and bottom \
                  edges, y values down the left and right edges. Read tap/swipe \
-                 coordinates off the grid.",
-                GRID_STEP * 5
-            ),
-            (true, true) => format!(
-                "Screen coordinate space is {w}x{h} pixels (width x height) — \
-                 tap/swipe use these coordinates. The image is downscaled to \
-                 {iw}x{ih} for transfer, but the overlaid grid is labeled in \
-                 screen coordinates: magenta lines every {GRID_STEP}px, brighter \
-                 labeled (yellow) lines every {}px — x along the top/bottom \
-                 edges, y down the left/right edges. Read tap/swipe coordinates \
-                 off the grid.",
-                GRID_STEP * 5
-            ),
-            (false, false) => format!("Screen is {w}x{h} pixels (width x height)."),
-            (false, true) => format!(
-                "Screen coordinate space is {w}x{h} pixels (width x height) — \
-                 tap/swipe use these coordinates. The image is downscaled to \
-                 {iw}x{ih} for transfer (same aspect ratio); positions map \
-                 proportionally."
-            ),
+                 coordinates directly off the grid.",
+                GRID_STEP * GRID_LABEL_EVERY
+            )
+        } else {
+            format!(
+                "Image is {iw}x{ih} pixels (width x height); tap/swipe coordinates \
+                 are pixels in THIS image (origin top-left)."
+            )
         };
+        if marked {
+            note.push_str(
+                " The cyan ◯ crosshair marks where your last tap landed. The screen \
+                 didn't change after that tap, so it likely missed — check the \
+                 marker against your intended target and re-tap with a corrected \
+                 coordinate.",
+            );
+        }
         Ok(CallToolResult::success(vec![
             Content::text(note),
             Content::image(b64, "image/png".to_string()),
@@ -506,8 +612,21 @@ impl DeviceHub {
         let Some((px, py)) = self.to_device(x, y) else {
             return ok_text("No screen available — connect a device first.");
         };
+        if let Some((iw, ih)) = *self.last_image.lock().unwrap() {
+            *self.last_tap.lock().unwrap() = Some((
+                (x / iw as f32).clamp(0.0, 1.0),
+                (y / ih as f32).clamp(0.0, 1.0),
+            ));
+        }
+        let before = self.frames.latest().map(|(_, f)| frame_signature(&f));
         self.press(px, py).await;
-        tokio::time::sleep(SETTLE).await;
+        self.settle().await;
+        let after = self.frames.latest().map(|(_, f)| frame_signature(&f));
+        if let (Some(a), Some(b)) = (&before, &after)
+            && signature_diff(a, b) >= TAP_CHANGED_DIFF
+        {
+            *self.last_tap.lock().unwrap() = None;
+        }
         ok_text(format!("Tapped ({x}, {y})."))
     }
 
@@ -528,6 +647,8 @@ impl DeviceHub {
         let Some((sx, sy)) = self.to_device(x1, y1) else {
             return ok_text("No screen available — connect a device first.");
         };
+        // A swipe isn't a single point; drop any stale tap marker.
+        *self.last_tap.lock().unwrap() = None;
         let dur = duration_ms.unwrap_or(300).clamp(50, 5000);
         // ~60 Hz of move samples; iOS reads the velocity for momentum.
         let steps = (dur / 16).clamp(2, 150);
@@ -544,7 +665,7 @@ impl DeviceHub {
         if let Some((ex, ey)) = self.to_device(x2, y2) {
             self.input.send(InputCmd::TouchUp { x: ex, y: ey });
         }
-        tokio::time::sleep(SETTLE).await;
+        self.settle().await;
         ok_text(format!("Swiped ({x1}, {y1}) → ({x2}, {y2}) over {dur}ms."))
     }
 
@@ -570,6 +691,7 @@ impl DeviceHub {
             return ok_text(format!("Unknown key '{key}'."));
         };
         self.input.send(InputCmd::KeyUsage(usage));
+        self.settle().await;
         ok_text(format!("Pressed {key}."))
     }
 
@@ -584,7 +706,9 @@ impl DeviceHub {
         let Some(label) = button_label(&button) else {
             return ok_text(format!("Unknown button '{button}'."));
         };
+        *self.last_tap.lock().unwrap() = None;
         self.input.send(InputCmd::Button(label));
+        self.settle().await;
         ok_text(format!("Pressed {label} button."))
     }
 
@@ -598,7 +722,10 @@ impl DeviceHub {
             "right" | "cw" | "clockwise" => RotateDir::Right,
             _ => return ok_text(format!("Unknown direction '{direction}' (use left/right).")),
         };
+        // Orientation change invalidates the upright-space tap fraction.
+        *self.last_tap.lock().unwrap() = None;
         self.input.send(InputCmd::Rotate(dir));
+        self.settle().await;
         ok_text(format!("Rotated {direction}."))
     }
 
@@ -698,8 +825,13 @@ impl ServerHandler for DeviceHub {
                 "Control a connected iPhone like a person: call `screenshot` to see the \
                  screen, then `tap`/`swipe`/`type_text`/`press_key`/`press_button` to act, \
                  and `screenshot` again to observe the result. Tap/swipe coordinates are \
-                 pixels in the most recent screenshot. Use `list_devices` and \
-                 `connect_device` to choose a device if none is connected."
+                 pixels in the most recent screenshot. Small targets like app icons are \
+                 easy to misjudge — after a `tap`, the next `screenshot` shows a cyan ◯ \
+                 marker where your tap actually landed; if it's off the target, re-tap with \
+                 a corrected coordinate before moving on. Actions wait for on-screen \
+                 animations to settle before returning, so the next screenshot is current. \
+                 Use `list_devices` and `connect_device` to choose a device if none is \
+                 connected."
                     .to_string(),
             )
     }
@@ -786,6 +918,34 @@ mod tests {
         let mut rgba = vec![128u8; (w * h * 4) as usize];
         draw_grid(&mut rgba, w, h, w, h);
         assert_eq!(rgba.len(), (w * h * 4) as usize);
+    }
+
+    #[test]
+    fn marker_stays_in_bounds_even_at_edges() {
+        let (w, h) = (393u32, 851u32);
+        let mut rgba = vec![128u8; (w * h * 4) as usize];
+        for (cx, cy) in [(w as i32 / 2, h as i32 / 2), (0, 0), (-50, h as i32 + 80)] {
+            draw_marker(&mut rgba, w, h, cx, cy);
+        }
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+    }
+
+    #[test]
+    fn signature_detects_motion_and_ignores_noise() {
+        let frame = |fill: u8| Frame {
+            width: 64,
+            height: 64,
+            rgba: vec![fill; 64 * 64 * 4],
+        };
+        let base = frame_signature(&frame(100));
+        // Identical frames: zero difference (settled).
+        assert!(signature_diff(&base, &frame_signature(&frame(100))) < SETTLE_DIFF);
+        // A 1-luma codec-noise wobble still counts as settled.
+        assert!(signature_diff(&base, &frame_signature(&frame(101))) < SETTLE_DIFF);
+        // A large change (animation) is well above threshold.
+        assert!(signature_diff(&base, &frame_signature(&frame(180))) >= SETTLE_DIFF);
+        // Mismatched/empty signatures are treated as "still moving".
+        assert_eq!(signature_diff(&base, &[]), f32::INFINITY);
     }
 
     #[test]
