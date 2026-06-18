@@ -26,10 +26,11 @@ struct FrameSlotInner {
 }
 
 impl FrameSlot {
-    pub fn publish(&self, frame: Frame) {
+    pub fn publish(&self, frame: Arc<Frame>) -> Option<Arc<Frame>> {
         let mut inner = self.0.lock().unwrap();
-        inner.frame = Some(Arc::new(frame));
+        let prev = inner.frame.replace(frame);
         inner.version = inner.version.wrapping_add(1);
+        prev
     }
 
     /// The latest frame and its version, without consuming it.

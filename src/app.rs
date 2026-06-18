@@ -306,7 +306,8 @@ impl DeviceHubApp {
             }
             self.last_frame_version = version;
             let size = [frame.width, frame.height];
-            let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
+            let pixels = bytemuck::cast_slice::<u8, egui::Color32>(&frame.rgba).to_vec();
+            let image = egui::ColorImage { size, pixels };
             match &mut self.texture {
                 Some(tex) if self.tex_size == size => {
                     tex.set(image, egui::TextureOptions::LINEAR);

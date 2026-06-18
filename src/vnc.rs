@@ -4,6 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use flate2::{Compress, Compression, FlushCompress};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -16,6 +17,12 @@ use crate::protocol::{
 
 /// Minimum interval between framebuffer pushes (~30 fps).
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Whether to offer the `Zlib` encoding (RFB 6). Disabled: macOS Screen Sharing
+/// advertises it but its plain-Zlib decoder mishandles the stream (intermittent
+/// colour bands / flashes), while our diffed Raw rectangles decode cleanly. The
+/// proper compressed path for that client is ZRLE (encoding 16), not Zlib.
+const ALLOW_ZLIB: bool = false;
 
 /// Framebuffer size advertised in `ServerInit` before any frame arrives; the
 /// real size follows via a desktop-size update.
@@ -65,6 +72,16 @@ fn random_challenge() -> [u8; 16] {
     out[..8].copy_from_slice(&next().to_le_bytes());
     out[8..].copy_from_slice(&next().to_le_bytes());
     out
+}
+
+/// Aborts the task it holds when dropped — used to tear down a client's
+/// message-reader task when its connection handler returns.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// A running VNC listener: the accept-loop task plus its per-client tasks.
@@ -382,6 +399,27 @@ fn render(
     let w = dw.min(bound_w);
     let h = dh.min(bound_h);
     let (nw, nh) = (frame.width, frame.height);
+
+    if turns.is_multiple_of(4)
+        && pf.bits_per_pixel == 32
+        && !pf.big_endian
+        && (pf.red_max, pf.green_max, pf.blue_max) == (255, 255, 255)
+    {
+        let (w, h) = (w as usize, h as usize);
+        let (rs, gs, bs) = (pf.red_shift, pf.green_shift, pf.blue_shift);
+        let mut out = vec![0u8; w * h * 4];
+        for oy in 0..h {
+            let src = &frame.rgba[oy * nw * 4..];
+            let dst = &mut out[oy * w * 4..];
+            for ox in 0..w {
+                let s = &src[ox * 4..];
+                let v = (s[0] as u32) << rs | (s[1] as u32) << gs | (s[2] as u32) << bs;
+                dst[ox * 4..ox * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        return (w as u16, h as u16, out);
+    }
+
     let mut out = Vec::with_capacity(w as usize * h as usize * pf.bytes_per_pixel());
     for oy in 0..h {
         for ox in 0..w {
@@ -419,29 +457,157 @@ fn solid_rect(pf: &PixelFormat, w: u16, h: u16, r: u8, g: u8, b: u8) -> Vec<u8> 
     out
 }
 
-/// Send one `FramebufferUpdate`, optionally carrying a desktop-size pseudo-rect
-/// and a Raw pixel rectangle.
-async fn send_framebuffer_update(
+/// One encoded rectangle ready for the wire: its position/size, RFB encoding
+/// number, and the post-header payload (Raw pixels, or the Zlib length+stream
+/// bytes already framed).
+struct EncodedRect {
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    encoding: i32,
+    data: Vec<u8>,
+}
+
+/// Send one `FramebufferUpdate`: an optional desktop-size pseudo-rect followed by
+/// `rects` pixel rectangles in whatever encoding each was built with.
+async fn send_rects(
     wr: &mut OwnedWriteHalf,
     resize: Option<(u16, u16, bool)>,
-    pixels: Option<(u16, u16, &[u8])>,
+    rects: &[EncodedRect],
 ) -> std::io::Result<()> {
-    let count = resize.is_some() as u16 + pixels.is_some() as u16;
+    let count = resize.is_some() as u16 + rects.len() as u16;
     wr.write_u8(0).await?; // message-type: FramebufferUpdate
     wr.write_u8(0).await?; // padding
     wr.write_u16(count).await?;
     if let Some((w, h, ext)) = resize {
         write_resize_rect(wr, w, h, ext).await?;
     }
-    if let Some((w, h, buf)) = pixels {
-        wr.write_u16(0).await?; // x
-        wr.write_u16(0).await?; // y
-        wr.write_u16(w).await?;
-        wr.write_u16(h).await?;
-        wr.write_i32(0).await?; // encoding: Raw
-        wr.write_all(buf).await?;
+    for r in rects {
+        wr.write_u16(r.x).await?;
+        wr.write_u16(r.y).await?;
+        wr.write_u16(r.w).await?;
+        wr.write_u16(r.h).await?;
+        wr.write_i32(r.encoding).await?;
+        wr.write_all(&r.data).await?;
     }
     wr.flush().await
+}
+
+const TILE: usize = 64;
+
+fn dirty_rects(
+    prev: &[u8],
+    cur: &[u8],
+    w: usize,
+    h: usize,
+    bpp: usize,
+) -> Vec<(usize, usize, usize, usize)> {
+    let stride = w * bpp;
+    let mut rects = Vec::new();
+    let mut ty = 0;
+    while ty < h {
+        let th = TILE.min(h - ty);
+        let mut run_start: Option<usize> = None;
+        let mut tx = 0;
+        while tx < w {
+            let tw = TILE.min(w - tx);
+            let changed = (ty..ty + th).any(|y| {
+                let row = y * stride;
+                prev[row + tx * bpp..row + (tx + tw) * bpp]
+                    != cur[row + tx * bpp..row + (tx + tw) * bpp]
+            });
+            match (changed, run_start) {
+                (true, None) => run_start = Some(tx),
+                (false, Some(s)) => {
+                    rects.push((s, ty, tx - s, th));
+                    run_start = None;
+                }
+                _ => {}
+            }
+            tx += tw;
+        }
+        if let Some(s) = run_start {
+            rects.push((s, ty, w - s, th));
+        }
+        ty += th;
+    }
+    rects
+}
+
+fn extract_rect(
+    buf: &[u8],
+    fb_w: usize,
+    bpp: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> Vec<u8> {
+    let stride = fb_w * bpp;
+    let mut out = Vec::with_capacity(w * h * bpp);
+    for row in y..y + h {
+        let base = row * stride + x * bpp;
+        out.extend_from_slice(&buf[base..base + w * bpp]);
+    }
+    out
+}
+
+fn deflate(z: &mut Compress, input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + input.len() / 2);
+    let start_in = z.total_in();
+    loop {
+        if out.len() == out.capacity() {
+            out.reserve(out.capacity().max(1024));
+        }
+        let consumed = (z.total_in() - start_in) as usize;
+        z.compress_vec(&input[consumed..], &mut out, FlushCompress::Sync)
+            .expect("zlib compress is infallible for in-memory buffers");
+        // After a Sync flush, we're done once all input is consumed and the
+        // output buffer still had spare room (so the flush emitted everything).
+        if (z.total_in() - start_in) as usize == input.len() && out.len() < out.capacity() {
+            break;
+        }
+    }
+    out
+}
+
+fn build_rects(
+    cur: &[u8],
+    prev: Option<&Vec<u8>>,
+    dims: (usize, usize, usize),
+    force_full: bool,
+    use_zlib: bool,
+    zlib: &mut Compress,
+) -> Vec<EncodedRect> {
+    let (w, h, bpp) = dims;
+    let regions = match prev {
+        Some(p) if !force_full && p.len() == cur.len() => dirty_rects(p, cur, w, h, bpp),
+        _ => vec![(0, 0, w, h)],
+    };
+    regions
+        .into_iter()
+        .map(|(rx, ry, rw, rh)| {
+            let pixels = extract_rect(cur, w, bpp, rx, ry, rw, rh);
+            let (encoding, data) = if use_zlib {
+                let comp = deflate(zlib, &pixels);
+                let mut data = Vec::with_capacity(4 + comp.len());
+                data.extend_from_slice(&(comp.len() as u32).to_be_bytes());
+                data.extend_from_slice(&comp);
+                (6, data)
+            } else {
+                (0, pixels)
+            };
+            EncodedRect {
+                x: rx as u16,
+                y: ry as u16,
+                w: rw as u16,
+                h: rh as u16,
+                encoding,
+                data,
+            }
+        })
+        .collect()
 }
 
 /// Write a desktop-size pseudo-encoding rectangle: `ExtendedDesktopSize` (-308)
@@ -645,6 +811,19 @@ async fn handle_client(
     // --- Session state ---
     let mut supports_ext_size = false;
     let mut supports_size = false;
+    // Whether the client offered the Zlib encoding (RFB 6). One persistent zlib
+    // stream serves the whole connection; its history is what lets near-identical
+    // successive frames compress to almost nothing.
+    let mut use_zlib = false;
+    // Level 1 ("best speed"): it must keep up with the frame rate on this task, and
+    // UI content still compresses heavily; higher levels cost CPU (latency) for
+    // little gain on screen captures.
+    let mut zlib = Compress::new(Compression::new(1), true);
+    // The last framebuffer we sent, with its dimensions, in the client's pixel
+    // format — kept to diff the next frame against. Reset to `None` (forcing a
+    // full update) on a pixel-format change, and only used when the new frame's
+    // dimensions match exactly, so we never diff across mismatched layouts.
+    let mut last_sent: Option<(u16, u16, Vec<u8>)> = None;
     let mut pending = false; // a FramebufferUpdateRequest is outstanding
     let mut pending_full = false; // ...and it was non-incremental (send even if unchanged)
     // Until we've sent any framebuffer, answer a request with a blank frame so a
@@ -660,14 +839,39 @@ async fn handle_client(
 
     let mut tick = tokio::time::interval(FRAME_INTERVAL);
 
+    // Read client messages in their own task, delivering whole messages over a
+    // channel. `read_client_message` is not cancel-safe — if `select!` dropped it
+    // mid-message (a message split across TCP segments, parked on `read_exact`,
+    // while the frame tick fires), the bytes already consumed would be lost and
+    // every later message would be misparsed, corrupting `pf`/encodings and thus
+    // the rendered image. Channel `recv` *is* cancel-safe, so the tick can never
+    // truncate a read. The task is aborted when this handler returns.
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _reader = AbortOnDrop(tokio::spawn(async move {
+        while let Ok(msg) = read_client_message(&mut rd).await {
+            if msg_tx.send(msg).is_err() {
+                break; // handler gone
+            }
+        }
+        // On read error/EOF, dropping `msg_tx` closes the channel, which the
+        // handler observes as `None` and treats as a disconnect.
+    }));
+
     loop {
         tokio::select! {
-            msg = read_client_message(&mut rd) => {
-                match msg? {
-                    ClientMsg::SetPixelFormat(p) => pf = p,
+            msg = msg_rx.recv() => {
+                let Some(msg) = msg else {
+                    return Ok(()); // client disconnected or sent a bad message
+                };
+                match msg {
+                    ClientMsg::SetPixelFormat(p) => {
+                        pf = p;
+                        last_sent = None; // new layout: next update must be full
+                    }
                     ClientMsg::SetEncodings(encs) => {
                         supports_ext_size = encs.contains(&-308);
                         supports_size = encs.contains(&-223);
+                        use_zlib = ALLOW_ZLIB && encs.contains(&6);
                     }
                     ClientMsg::FbUpdateRequest { incremental } => {
                         pending = true;
@@ -736,17 +940,41 @@ async fn handle_client(
                         // On a size change, renegotiate via desktop-size if the
                         // client supports it; otherwise keep the size and clip.
                         let mut resize = None;
+                        let mut force_full = pending_full || !sent_anything;
                         if (dw, dh) != (fb_w, fb_h) && (supports_ext_size || supports_size) {
                             fb_w = dw;
                             fb_h = dh;
                             resize = Some((dw, dh, supports_ext_size));
+                            force_full = true; // can't diff across a size change
                         }
 
                         let (w, h, buf) = render(&frame, turns, &pf, fb_w, fb_h);
-                        send_framebuffer_update(&mut wr, resize, Some((w, h, &buf))).await?;
+                        let bpp = pf.bytes_per_pixel();
+                        // Only diff against the previous frame when its dimensions
+                        // match exactly; otherwise force a full update.
+                        let prev = match &last_sent {
+                            Some((pw, ph, pbuf)) if (*pw, *ph) == (w, h) => Some(pbuf),
+                            _ => None,
+                        };
+                        let rects = build_rects(
+                            &buf, prev, (w as usize, h as usize, bpp),
+                            force_full, use_zlib, &mut zlib,
+                        );
+
+                        // Nothing visibly changed (the diff fell entirely outside
+                        // the clipped region). Refresh our reference and keep the
+                        // request outstanding so we answer when real change lands.
+                        if rects.is_empty() {
+                            last_sent = Some((w, h, buf));
+                            last_sent_version = version;
+                            continue;
+                        }
+
+                        send_rects(&mut wr, resize, &rects).await?;
                         if !sent_anything {
                             tracing::info!("VNC sent first framebuffer update {w}x{h}");
                         }
+                        last_sent = Some((w, h, buf));
                         last_sent_version = version;
                         sent_anything = true;
                         pending = false;
@@ -755,8 +983,17 @@ async fn handle_client(
                     // No decoded frame yet: send one blank frame so the client
                     // finishes connecting, then wait for real video.
                     None if !sent_anything => {
-                        let buf = solid_rect(&pf, fb_w, fb_h, 16, 16, 16);
-                        send_framebuffer_update(&mut wr, None, Some((fb_w, fb_h, &buf))).await?;
+                        // One-time placeholder, always Raw; leave `last_sent` unset
+                        // so the first real frame is sent as a clean full update.
+                        let blank = EncodedRect {
+                            x: 0,
+                            y: 0,
+                            w: fb_w,
+                            h: fb_h,
+                            encoding: 0,
+                            data: solid_rect(&pf, fb_w, fb_h, 16, 16, 16),
+                        };
+                        send_rects(&mut wr, None, &[blank]).await?;
                         tracing::info!("VNC sent blank {fb_w}x{fb_h} (no video yet)");
                         sent_anything = true;
                         pending = false;

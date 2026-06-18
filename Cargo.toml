@@ -48,3 +48,8 @@ axum = "0.8"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Zero-cost reinterpret of decoded RGBA bytes as egui `Color32` for texture upload.
+bytemuck = "1"
+# Deflate for the VNC `Zlib` encoding (RFB encoding 6): we compress only the
+# changed rectangles of each frame over a single persistent stream per client.
+flate2 = "1"

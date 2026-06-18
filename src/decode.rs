@@ -1,16 +1,18 @@
-// HEVC decode via an `ffmpeg` subprocess: Annex-B in on stdin, PPM frames out on
-// stdout. PPM is self-describing, so resolution/rotation changes need no extra
-// signalling.
+// HEVC decode via an `ffmpeg` subprocess: Annex-B in on stdin, PAM (P7) frames
+// out on stdout. PAM is self-describing (size in every header, so resolution
+// changes need no extra signalling) and, unlike PPM, carries an alpha channel —
+// so we ask ffmpeg for `rgba` directly and publish its bytes verbatim, with no
+// per-pixel RGB→RGBA expansion pass on our side.
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Notify;
 
 use crate::protocol::{Frame, FrameSlot};
 
-/// Spawn `ffmpeg` decoding raw HEVC (Annex-B on stdin) to PPM frames on stdout.
+/// Spawn `ffmpeg` decoding raw HEVC (Annex-B on stdin) to PAM frames on stdout.
 /// stderr is piped so the session can watch it for decode errors.
 pub fn spawn_ffmpeg() -> std::io::Result<(Child, ChildStdin, ChildStdout, ChildStderr)> {
     let mut child = Command::new("ffmpeg")
@@ -24,9 +26,9 @@ pub fn spawn_ffmpeg() -> std::io::Result<(Child, ChildStdin, ChildStdout, ChildS
             "-f",
             "image2pipe",
             "-vcodec",
-            "ppm",
+            "pam",
             "-pix_fmt",
-            "rgb24",
+            "rgba",
         ])
         .arg("pipe:1")
         .args(["-loglevel", "error"])
@@ -42,9 +44,10 @@ pub fn spawn_ffmpeg() -> std::io::Result<(Child, ChildStdin, ChildStdout, ChildS
     Ok((child, stdin, stdout, stderr))
 }
 
-/// Read PPM frames from ffmpeg's stdout, publishing each as RGBA into `slot` and
-/// waking the UI via `repaint`. Each frame pulses `beat`, the liveness heartbeat
-/// watched by the session's stall watchdog. Returns when the stream ends.
+/// Read PAM frames from ffmpeg's stdout, publishing each (already RGBA) into
+/// `slot` and waking the UI via `repaint`. Each frame pulses `beat`, the liveness
+/// heartbeat watched by the session's stall watchdog. Returns when the stream
+/// ends.
 pub async fn read_frames(
     stdout: ChildStdout,
     slot: FrameSlot,
@@ -53,12 +56,12 @@ pub async fn read_frames(
 ) {
     let mut reader = BufReader::new(stdout);
     let mut last_dims: Option<(usize, usize)> = None;
-    // A static screen still streams at display rate (HEVC emits near-empty
-    // P-frames), so skip publishing identical frames to let the UI go idle.
-    let mut last_rgb: Vec<u8> = Vec::new();
+    let mut read_buf: Vec<u8> = Vec::new();
+    let mut last: Option<Arc<Frame>> = None;
+    let mut pool: Vec<Vec<u8>> = Vec::new();
     loop {
-        match read_ppm(&mut reader).await {
-            Ok(Some((width, height, rgb))) => {
+        match read_pam(&mut reader, &mut read_buf).await {
+            Ok(Some((width, height))) => {
                 let dims = (width, height);
                 if last_dims != Some(dims) {
                     tracing::info!("decoded frame size: {}x{}", dims.0, dims.1);
@@ -69,12 +72,23 @@ pub async fn read_frames(
                 // screen is still a healthy stream.
                 beat.notify_one();
 
-                if rgb == last_rgb {
+                if last.as_ref().is_some_and(|p| p.rgba == read_buf) {
                     continue;
                 }
 
-                slot.publish(rgb_to_frame(width, height, &rgb));
-                last_rgb = rgb;
+                let frame = Arc::new(Frame {
+                    width,
+                    height,
+                    rgba: std::mem::take(&mut read_buf),
+                });
+                read_buf = pool.pop().unwrap_or_default();
+                last = Some(frame.clone());
+                if let Some(prev) = slot.publish(frame)
+                    && let Ok(frame) = Arc::try_unwrap(prev)
+                    && pool.len() < 2
+                {
+                    pool.push(frame.rgba);
+                }
                 repaint();
             }
             Ok(None) => {
@@ -82,85 +96,93 @@ pub async fn read_frames(
                 break;
             }
             Err(e) => {
-                tracing::warn!("ppm read error: {e}");
+                tracing::warn!("pam read error: {e}");
                 break;
             }
         }
     }
 }
 
-/// Expand a top-down RGB raster to an opaque RGBA [`Frame`].
-fn rgb_to_frame(width: usize, height: usize, rgb: &[u8]) -> Frame {
-    let mut rgba = vec![0u8; width * height * 4];
-    for (src, dst) in rgb.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
-        dst[0] = src[0];
-        dst[1] = src[1];
-        dst[2] = src[2];
-        dst[3] = 255;
-    }
-    Frame {
-        width,
-        height,
-        rgba,
-    }
-}
-
-/// Read a single binary PPM (P6) image as a raw top-down RGB raster. Returns
-/// `Ok(None)` at clean EOF.
-async fn read_ppm<R: AsyncReadExt + Unpin>(
+/// Read a single binary PAM (P7) image into `rgba` as a raw top-down RGBA raster,
+/// reusing its allocation. Returns the dimensions, or `Ok(None)` at clean EOF.
+///
+/// PAM headers are line-oriented: `P7`, then `KEY VALUE` lines (`WIDTH`,
+/// `HEIGHT`, `DEPTH`, `MAXVAL`, `TUPLTYPE`) in any order, terminated by `ENDHDR`,
+/// then the raster. We require the 4-channel/8-bit layout ffmpeg emits for `rgba`.
+async fn read_pam<R: AsyncReadExt + AsyncBufReadExt + Unpin>(
     r: &mut R,
-) -> std::io::Result<Option<(usize, usize, Vec<u8>)>> {
-    let mut magic = [0u8; 2];
-    match r.read_exact(&mut magic).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-    if &magic != b"P6" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("expected PPM 'P6' magic, got {magic:?}"),
-        ));
-    }
+    rgba: &mut Vec<u8>,
+) -> std::io::Result<Option<(usize, usize)>> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
 
-    let width: usize = read_header_uint(r).await?;
-    let height: usize = read_header_uint(r).await?;
-    let maxval: usize = read_header_uint(r).await?;
-    if maxval == 0 || maxval > 255 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("unsupported PPM maxval {maxval}"),
-        ));
+    let mut line = Vec::new();
+    // First line: the `P7` magic. Zero bytes here is a clean end-of-stream.
+    if r.read_until(b'\n', &mut line).await? == 0 {
+        return Ok(None);
+    }
+    if trim(&line) != b"P7" {
+        return Err(invalid(format!(
+            "expected PAM 'P7' magic, got {:?}",
+            trim(&line)
+        )));
     }
 
-    // `read_header_uint` already consumed the whitespace byte after maxval, so
-    // the raster starts here — do NOT consume another or every frame desyncs.
-    let mut rgb = vec![0u8; width * height * 3];
-    r.read_exact(&mut rgb).await?;
+    let (mut width, mut height, mut depth, mut maxval) = (0usize, 0usize, 0usize, 0usize);
+    loop {
+        line.clear();
+        if r.read_until(b'\n', &mut line).await? == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        let l = trim(&line);
+        if l == b"ENDHDR" {
+            break;
+        }
+        if l.is_empty() || l[0] == b'#' {
+            continue;
+        }
+        // Parse `KEY VALUE`; only the numeric fields matter (TUPLTYPE is ignored).
+        let text = String::from_utf8_lossy(l);
+        let mut it = text.split_ascii_whitespace();
+        let key = it.next().unwrap_or("");
+        let slot = match key {
+            "WIDTH" => &mut width,
+            "HEIGHT" => &mut height,
+            "DEPTH" => &mut depth,
+            "MAXVAL" => &mut maxval,
+            _ => continue,
+        };
+        *slot = it
+            .next()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| invalid(format!("bad PAM header line: {text:?}")))?;
+    }
 
-    Ok(Some((width, height, rgb)))
+    if depth != 4 || maxval != 255 {
+        return Err(invalid(format!(
+            "expected 8-bit 4-channel PAM, got depth={depth} maxval={maxval}"
+        )));
+    }
+    if width == 0 || height == 0 {
+        return Err(invalid(format!("bad PAM dimensions {width}x{height}")));
+    }
+
+    rgba.resize(width * height * depth, 0);
+    r.read_exact(rgba).await?;
+    Ok(Some((width, height)))
 }
 
-/// Read a whitespace-delimited ASCII unsigned integer from a PPM header,
-/// skipping leading whitespace and `#` comment lines.
-async fn read_header_uint<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<usize> {
-    let mut b = [0u8; 1];
-    loop {
-        r.read_exact(&mut b).await?;
-        match b[0] {
-            b' ' | b'\t' | b'\n' | b'\r' => continue,
-            b'#' => {
-                while b[0] != b'\n' {
-                    r.read_exact(&mut b).await?;
-                }
-            }
-            _ => break,
-        }
+/// Strip a trailing `\n`/`\r\n` and surrounding ASCII whitespace from a header line.
+fn trim(line: &[u8]) -> &[u8] {
+    let mut s = line;
+    while let [rest @ .., last] = s
+        && last.is_ascii_whitespace()
+    {
+        s = rest;
     }
-    let mut value: usize = 0;
-    while b[0].is_ascii_digit() {
-        value = value * 10 + (b[0] - b'0') as usize;
-        r.read_exact(&mut b).await?;
+    while let [first, rest @ ..] = s
+        && first.is_ascii_whitespace()
+    {
+        s = rest;
     }
-    Ok(value)
+    s
 }
